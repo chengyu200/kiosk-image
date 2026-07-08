@@ -1,0 +1,284 @@
+#!/bin/sh
+#
+# Custom initramfs init script for kiosk image
+# Based on Volumio's initv3 architecture, simplified for kiosk use.
+#
+# This script:
+#   1. Parses kernel cmdline for partition UUIDs
+#   2. Mounts the image partition (ext4) containing the squashfs
+#   3. Loop-mounts the squashfs as read-only root
+#   4. Mounts the data partition (ext4) as writable overlay
+#   5. Creates an overlay filesystem merging both
+#   6. Pivots to the real root and execs systemd
+#
+# Required cmdline parameters:
+#   imgpart=UUID=xxx        ext4 partition containing the squashfs file
+#   imgfile=system.sqsh     squashfs filename on imgpart
+#   datapart=UUID=xxx       ext4 partition for writable overlay
+#
+# Optional cmdline parameters:
+#   debug                   enable debug output (set -x)
+#   break=<point>           drop to shell at specified breakpoint
+#                          (valid: init, mount, overlay, switch)
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+# === Mount essential virtual filesystems ===
+[ -d /dev ]  || mkdir -m 0755 /dev
+[ -d /sys ]  || mkdir /sys
+[ -d /proc ] || mkdir /proc
+[ -d /tmp ]  || mkdir /tmp
+
+mount -t sysfs -o nodev,noexec,nosuid sysfs /sys
+mount -t proc -o nodev,noexec,nosuid proc /proc
+mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev
+mkdir -p /dev/pts /dev/disk/by-uuid /dev/disk/by-label /dev/disk/by-partuuid
+mount -t devpts -o noexec,nosuid,gid=5,mode=0620 devpts /dev/pts 2>/dev/null || true
+
+# === Parse kernel cmdline ===
+for x in $(cat /proc/cmdline); do
+    case "$x" in
+        imgpart=*)   IMAGE_PARTITION="${x#imgpart=}" ;;
+        imgfile=*)   SQUASH_FILE="${x#imgfile=}" ;;
+        datapart=*)  DATA_PARTITION="${x#datapart=}" ;;
+        debug)       set -x ;;
+        break=*)     BREAK_POINT="${x#break=}" ;;
+        quiet)       QUIET=1 ;;
+    esac
+done
+
+log() {
+    [ -z "$QUIET" ] && echo "[init] $*"
+}
+
+maybe_break() {
+    if [ "$BREAK_POINT" = "$1" ]; then
+        echo "[init] Breakpoint '$1' reached. Dropping to shell."
+        exec /bin/sh
+    fi
+}
+
+SQUASH_FILE="${SQUASH_FILE:-system.sqsh}"
+
+log "Kiosk initramfs starting..."
+log "  imgpart:  ${IMAGE_PARTITION:-<not set>}"
+log "  imgfile:  ${SQUASH_FILE}"
+log "  datapart: ${DATA_PARTITION:-<not set>}"
+
+maybe_break init
+
+# === Load kernel modules ===
+KVER=$(ls /lib/modules/ 2>/dev/null | head -1)
+KMODDIR="/lib/modules/${KVER}/kernel"
+
+log "Loading kernel modules (KVER=$KVER)..."
+# Try modprobe first for all modules (handles dependencies via modules.dep)
+for mod in squashfs overlay ext4 vfat virtio_blk virtio_net virtio_pci virtio_pci_modern_dev \
+           loop dm_mod nls_cp437 nls_iso8859_1 \
+           ahci sd_mod sr_mod ata_piix pata_acpi \
+           usbcore usb_common usb_storage uas \
+           xhci_hcd xhci_pci ehci_hcd ehci_pci ohci_hcd ohci_pci uhci_hcd \
+           usbhid hid hid_generic; do
+    modprobe "$mod" 2>/dev/null
+done
+
+# === Wait for block devices to appear ===
+log "Waiting for block devices..."
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    nbd=$(ls /sys/block/ 2>/dev/null | grep -vE "^loop|^ram|^fd" | wc -l)
+    if [ "$nbd" -gt 0 ]; then
+        log "Found $nbd block device(s) after ${i} second(s)"
+        break
+    fi
+    mdev -s 2>/dev/null
+    log "  try $i: waiting for devices..."
+    sleep 1
+done
+
+# === Trigger partition table scan ===
+log "Triggering partition table scan..."
+for disk in /dev/sd[a-z] /dev/vd[a-z] /dev/nvme[0-9]*n[0-9]*; do
+    [ -b "$disk" ] || continue
+    blockdev --rereadpt "$disk" 2>/dev/null || \
+        echo 1 > "/sys/block/$(basename $disk)/device/rescan" 2>/dev/null || true
+done
+
+# Wait for partition devices to appear
+for i in 1 2 3 4 5; do
+    nparts=$(ls /dev/sd*[0-9] /dev/vd*[0-9] /dev/nvme*p[0-9] /dev/mmcblk*p[0-9] 2>/dev/null | wc -l)
+    [ "$nparts" -gt 0 ] && break
+    sleep 1
+done
+
+# Re-create device nodes (partitions may have appeared after scan)
+mdev -s 2>/dev/null
+
+# === Populate /dev/disk/by-uuid ===
+log "Populating /dev/disk/by-uuid/..."
+if command -v blkid >/dev/null 2>&1; then
+    for dev in /dev/sd*[0-9] /dev/vd*[0-9] /dev/nvme*p[0-9] /dev/mmcblk*p[0-9]; do
+        [ -b "$dev" ] || continue
+        uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null)
+        [ -n "$uuid" ] && ln -sf "$dev" "/dev/disk/by-uuid/$uuid" 2>/dev/null
+        label=$(blkid -s LABEL -o value "$dev" 2>/dev/null)
+        [ -n "$label" ] && ln -sf "$dev" "/dev/disk/by-label/$label" 2>/dev/null
+    done
+fi
+
+# === Validate required parameters ===
+if [ -z "$IMAGE_PARTITION" ]; then
+    echo "[init] FATAL: 'imgpart=' not specified on kernel cmdline"
+    exec /bin/sh
+fi
+if [ -z "$DATA_PARTITION" ]; then
+    echo "[init] FATAL: 'datapart=' not specified on kernel cmdline"
+    exec /bin/sh
+fi
+
+# === Wait for and resolve partition devices ===
+log "Waiting for partitions: $IMAGE_PARTITION, $DATA_PARTITION"
+
+wait_for_device() {
+    local dev="$1"
+    local tries=0
+    while [ $tries -lt 30 ]; do
+        if echo "$dev" | grep -q "^UUID="; then
+            local uuid="${dev#UUID=}"
+            if [ -e "/dev/disk/by-uuid/$uuid" ]; then
+                echo "/dev/disk/by-uuid/$uuid"
+                return 0
+            fi
+            if command -v blkid >/dev/null 2>&1; then
+                local found=$(blkid -U "$uuid" 2>/dev/null)
+                if [ -n "$found" ] && [ -e "$found" ]; then
+                    echo "$found"
+                    return 0
+                fi
+            fi
+        elif echo "$dev" | grep -q "^LABEL="; then
+            local label="${dev#LABEL=}"
+            if [ -e "/dev/disk/by-label/$label" ]; then
+                echo "/dev/disk/by-label/$label"
+                return 0
+            fi
+        elif [ -e "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+        sleep 1
+        tries=$((tries + 1))
+        [ $((tries % 5)) -eq 0 ] && mdev -s 2>/dev/null
+    done
+    return 1
+}
+
+IMG_DEV=$(wait_for_device "$IMAGE_PARTITION") || {
+    echo "[init] FATAL: imgpart not found: $IMAGE_PARTITION"
+    exec /bin/sh
+}
+log "imgpart: $IMG_DEV"
+
+DATA_DEV=$(wait_for_device "$DATA_PARTITION") || {
+    echo "[init] FATAL: datapart not found: $DATA_PARTITION"
+    exec /bin/sh
+}
+log "datapart: $DATA_DEV"
+
+maybe_break mount
+
+# === Mount image partition (ext4, contains squashfs) ===
+mkdir -p /mnt/imgpart
+log "Mounting imgpart..."
+if ! mount -t ext4 "$IMG_DEV" /mnt/imgpart 2>/dev/null; then
+    log "Read-write failed, trying read-only (noload)..."
+    mount -t ext4 -o ro,noload "$IMG_DEV" /mnt/imgpart || {
+        echo "[init] FATAL: failed to mount imgpart"
+        exec /bin/sh
+    }
+fi
+
+if [ ! -f "/mnt/imgpart/${SQUASH_FILE}" ]; then
+    echo "[init] FATAL: squashfs not found: /mnt/imgpart/${SQUASH_FILE}"
+    ls -la /mnt/imgpart/
+    exec /bin/sh
+fi
+log "Found squashfs: ${SQUASH_FILE}"
+
+# === Loop-mount squashfs (read-only lower layer) ===
+mkdir -p /mnt/static
+log "Mounting squashfs..."
+LOOP_DEV=$(losetup -f 2>/dev/null)
+losetup "$LOOP_DEV" "/mnt/imgpart/${SQUASH_FILE}" || {
+    echo "[init] FATAL: losetup failed"
+    exec /bin/sh
+}
+mount -t squashfs "$LOOP_DEV" /mnt/static || {
+    echo "[init] FATAL: squashfs mount failed"
+    exec /bin/sh
+}
+log "Squashfs mounted"
+
+# === Mount data partition (ext4, writable overlay) ===
+mkdir -p /mnt/data
+log "Mounting datapart..."
+DATA_READONLY=no
+if mount -t ext4 -o noatime "$DATA_DEV" /mnt/data 2>/dev/null; then
+    if ! (touch /mnt/data/.write_test 2>/dev/null && rm -f /mnt/data/.write_test 2>/dev/null); then
+        log "datapart is read-only, remounting noload..."
+        umount /mnt/data 2>/dev/null
+        mount -t ext4 -o ro,noload "$DATA_DEV" /mnt/data 2>/dev/null
+        DATA_READONLY=yes
+    fi
+else
+    mount -t ext4 -o ro,noload "$DATA_DEV" /mnt/data 2>/dev/null && DATA_READONLY=yes || {
+        log "datapart unavailable, using tmpfs..."
+        mount -t tmpfs -o size=512M tmpfs /mnt/data
+        DATA_READONLY=tmpfs
+    }
+fi
+
+maybe_break overlay
+
+# === Create overlay filesystem ===
+if [ "$DATA_READONLY" == "no" ]; then
+    mkdir -p /mnt/data/dyn /mnt/data/work /mnt/data/union
+    chmod 777 /mnt/data/dyn /mnt/data/work /mnt/data/union
+    log "Creating overlay (persistent)..."
+    mount -t overlay overlay /mnt/data/union \
+        -o "lowerdir=/mnt/static,upperdir=/mnt/data/dyn,workdir=/mnt/data/work" || {
+        echo "[init] FATAL: overlay mount failed"
+        exec /bin/sh
+    }
+    UNION_ROOT="/mnt/data/union"
+else
+    log "Creating overlay with tmpfs (non-persistent)..."
+    mkdir -p /mnt/overlay /mnt/union
+    mount -t tmpfs -o size=512M tmpfs /mnt/overlay
+    mkdir -p /mnt/overlay/upper /mnt/overlay/work
+    chmod 777 /mnt/overlay/upper /mnt/overlay/work /mnt/union
+    mount -t overlay overlay /mnt/union \
+        -o "lowerdir=/mnt/static,upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work" || {
+        echo "[init] FATAL: overlay mount with tmpfs failed"
+        exec /bin/sh
+    }
+    UNION_ROOT="/mnt/union"
+fi
+log "Overlay created at $UNION_ROOT"
+
+# === Move mount points into the real root ===
+mkdir -p "$UNION_ROOT/mnt/static" "$UNION_ROOT/mnt/imgpart"
+mount --move /mnt/static "$UNION_ROOT/mnt/static" 2>/dev/null || true
+mount --move /mnt/imgpart "$UNION_ROOT/mnt/imgpart" 2>/dev/null || true
+mount --move /proc "$UNION_ROOT/proc" 2>/dev/null || true
+mount --move /sys  "$UNION_ROOT/sys"  2>/dev/null || true
+mount --move /dev  "$UNION_ROOT/dev"  2>/dev/null || true
+
+maybe_break switch
+
+# === Switch to real root and exec systemd ===
+log "Switching to real root ($UNION_ROOT)..."
+unset IMAGE_PARTITION DATA_PARTITION SQUASH_FILE BREAK_POINT QUIET
+exec run-init "$UNION_ROOT" /sbin/init "$@"
+
+echo "[init] FATAL: run-init failed!"
+exec /bin/sh
